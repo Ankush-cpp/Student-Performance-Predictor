@@ -4,6 +4,13 @@ data_loader.py
 Handles downloading, caching, and preprocessing the UCI Student Performance
 dataset (student-mat.csv).  G1 and G2 are intentionally excluded from
 features so the model cannot "cheat" by using earlier-term grades.
+
+The public API now returns a fitted scikit-learn ColumnTransformer (the
+"preprocessor") alongside the split data, so that:
+  • Training and inference use an identical, reproducible transformation.
+  • Categorical inputs at inference time are encoded with the same fitted
+    OrdinalEncoder — unknown categories raise a clear ValueError instead
+    of silently mapping to 0.
 """
 
 import io
@@ -14,8 +21,9 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from sklearn.compose import ColumnTransformer
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import OrdinalEncoder, StandardScaler
 
 # ── paths ──────────────────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -132,16 +140,62 @@ def load_raw_dataframe() -> pd.DataFrame:
     return df
 
 
+def build_preprocessor(df: pd.DataFrame) -> ColumnTransformer:
+    """
+    Build and fit a ColumnTransformer on *df*.
+
+    Categorical columns  → OrdinalEncoder  (handle_unknown='use_encoded_value',
+                                             unknown_value=-1)
+    Numerical columns    → StandardScaler  (zero mean, unit variance)
+
+    Setting handle_unknown='use_encoded_value' / unknown_value=-1 means that
+    any category not seen at fit time will produce a value of -1 rather than
+    silently mapping to 0 or raising a hard crash.  Tree-based models treat it
+    as a distinct split point; callers can inspect the -1 to warn the user.
+    """
+    # Collect the unique sorted categories from the training data so the
+    # encoder is fully deterministic.
+    categories = [
+        sorted(df[col].astype(str).unique().tolist())
+        for col in CATEGORICAL_COLS
+    ]
+
+    cat_transformer = OrdinalEncoder(
+        categories=categories,
+        handle_unknown="use_encoded_value",
+        unknown_value=-1,
+        dtype=float,
+    )
+    num_transformer = StandardScaler()
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("cat", cat_transformer, CATEGORICAL_COLS),
+            ("num", num_transformer, NUMERICAL_COLS),
+        ],
+        remainder="drop",
+    )
+    preprocessor.fit(df[CATEGORICAL_COLS + NUMERICAL_COLS])
+    return preprocessor
+
+
 def preprocess(df: pd.DataFrame):
     """
-    Encode categoricals, build feature matrix X and target vector y.
+    Build feature matrix X (numpy array) and target vector y using a
+    fitted ColumnTransformer.
 
     Returns
     -------
-    X : pd.DataFrame   feature matrix (no G1/G2/G3)
-    y : pd.Series      target (G3)
-    feature_names : list[str]
-    encoders : dict[str, LabelEncoder]
+    X            : np.ndarray  — transformed feature matrix (no G1/G2/G3)
+    y            : np.ndarray  — target (G3)
+    feature_names: list[str]   — CATEGORICAL_COLS + NUMERICAL_COLS
+    preprocessor : ColumnTransformer  — fitted transformer (use for inference)
+
+    Backward-compatibility note
+    ---------------------------
+    Previous callers expected a 4th return value of ``encoders`` (a dict of
+    LabelEncoders).  The new signature returns the ColumnTransformer instead.
+    The Streamlit app and tests have been updated accordingly.
     """
     df = df.copy()
 
@@ -150,31 +204,50 @@ def preprocess(df: pd.DataFrame):
     if df.empty:
         raise ValueError("No valid rows remain after dropping rows with missing G3.")
 
-    # Encode categorical columns
-    encoders: dict = {}
-    for col in CATEGORICAL_COLS:
-        le = LabelEncoder()
-        df[col] = le.fit_transform(df[col].astype(str))
-        encoders[col] = le
+    feature_names = CATEGORICAL_COLS + NUMERICAL_COLS
+    preprocessor = build_preprocessor(df)
 
-    feature_cols = [c for c in df.columns if c not in EXCLUDE_COLS]
-    X = df[feature_cols].copy()
-    y = df[TARGET_COL].copy()
+    X = preprocessor.transform(df[feature_names])
+    y = df[TARGET_COL].to_numpy()
 
-    return X, y, feature_cols, encoders
+    return X, y, feature_names, preprocessor
 
 
 def get_train_test_split(test_size: float = 0.2, random_state: int = 42):
     """
-    Full pipeline: load → preprocess → split.
+    Full pipeline: load → split (raw) → fit preprocessor on train only
+    → transform both sets.
+
+    Fitting the preprocessor **only on the training portion** prevents any
+    data leakage from the test set into the scaler / encoder statistics.
 
     Returns
     -------
-    X_train, X_test, y_train, y_test, feature_names, encoders, raw_df
+    X_train      : np.ndarray
+    X_test       : np.ndarray
+    y_train      : np.ndarray
+    y_test       : np.ndarray
+    feature_names: list[str]
+    preprocessor : ColumnTransformer  — fitted on train set only
+    raw_df       : pd.DataFrame       — the full un-split raw frame
     """
     raw_df = load_raw_dataframe()
-    X, y, feature_names, encoders = preprocess(raw_df)
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=test_size, random_state=random_state
+
+    # Drop rows with missing target before splitting
+    clean_df = raw_df.dropna(subset=[TARGET_COL]).copy()
+
+    feature_names = CATEGORICAL_COLS + NUMERICAL_COLS
+    X_raw = clean_df[feature_names]
+    y = clean_df[TARGET_COL].to_numpy()
+
+    X_raw_train, X_raw_test, y_train, y_test = train_test_split(
+        X_raw, y, test_size=test_size, random_state=random_state
     )
-    return X_train, X_test, y_train, y_test, feature_names, encoders, raw_df
+
+    # Fit the preprocessor on training data only — no leakage
+    preprocessor = build_preprocessor(X_raw_train)
+
+    X_train = preprocessor.transform(X_raw_train)
+    X_test = preprocessor.transform(X_raw_test)
+
+    return X_train, X_test, y_train, y_test, feature_names, preprocessor, raw_df

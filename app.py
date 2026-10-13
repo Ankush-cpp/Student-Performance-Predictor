@@ -161,16 +161,26 @@ def _hint(text: str) -> None:
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
-@st.cache_resource(show_spinner="Loading dataset and training model…")
+@st.cache_resource(show_spinner="Training and comparing models… (first run only)")
 def load_and_train():
-    """Load data, train model, cache result so re-runs are fast."""
-    X_train, X_test, y_train, y_test, feature_names, encoders, raw_df = (
+    """
+    Load data, run cross-validation comparison, select best model,
+    evaluate on test set.  Cached so re-runs are instant.
+
+    Returns
+    -------
+    model, metrics, cv_results, best_name, feature_names, preprocessor,
+    raw_df, X_test, y_test
+    """
+    X_train, X_test, y_train, y_test, feature_names, preprocessor, raw_df = (
         get_train_test_split(test_size=0.2, random_state=42)
     )
-    model = train_model(X_train, y_train, random_state=42)
+    model, cv_results, best_name = train_model(X_train, y_train, random_state=42)
     metrics = evaluate_model(model, X_test, y_test)
-    importance = get_feature_importance(model, feature_names)
-    return model, metrics, feature_names, encoders, raw_df, X_test, y_test
+    return (
+        model, metrics, cv_results, best_name,
+        feature_names, preprocessor, raw_df, X_test, y_test,
+    )
 
 
 def grade_color(grade: float) -> str:
@@ -194,7 +204,10 @@ def grade_label(grade: float) -> str:
 # ── load data ────────────────────────────────────────────────────────────────
 
 try:
-    model, metrics, feature_names, encoders, raw_df, X_test, y_test = load_and_train()
+    (
+        model, metrics, cv_results, best_name,
+        feature_names, preprocessor, raw_df, X_test, y_test,
+    ) = load_and_train()
 except ConnectionError as e:
     st.error("**Dataset download failed.**\n\n" + str(e))
     st.stop()
@@ -204,11 +217,21 @@ except Exception as e:
 
 # ── sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.image("https://upload.wikimedia.org/wikipedia/commons/1/1b/Graduation_hat.svg", width=60)
+    # Inline SVG graduation cap — no external URL, no file dependency
+    _CAP_SVG = (
+        "data:image/svg+xml;charset=utf-8,"
+        "%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 80'%3E"
+        "%3Cpolygon points='50,5 95,28 50,51 5,28' fill='%231f4e79'/%3E"
+        "%3Crect x='74' y='28' width='5' height='22' fill='%231f4e79'/%3E"
+        "%3Cellipse cx='76.5' cy='52' rx='7' ry='4' fill='%231f4e79'/%3E"
+        "%3Cpolygon points='50,51 85,34 85,54 50,71 15,54 15,34' fill='%235b9bd5'/%3E"
+        "%3C/svg%3E"
+    )
+    st.image(_CAP_SVG, width=60)
     st.title("🎓 Student\nPerformance\nPredictor")
     st.caption("UCI Student Performance Dataset — Math course")
     st.markdown("---")
-    st.markdown("""
+    st.markdown(f"""
 **About this tool**
 
 Enter a student's profile on the **Predict** tab and the model will
@@ -216,7 +239,9 @@ estimate their final grade (**G3**, 0–20 scale).
 
 Features used: study habits, demographics, family background, and
 school support — *not* prior term grades (G1/G2).
-    """)
+
+**Selected model:** {best_name}
+""")
     st.markdown("---")
     st.markdown("**Dataset stats**")
     st.write(f"• {len(raw_df)} students")
@@ -345,41 +370,41 @@ with tab_predict:
         submitted = st.form_submit_button("🔮 Predict Grade", use_container_width=True, type="primary")
 
     if submitted:
-        # Build input dict
+        # Build a raw single-row DataFrame matching feature order
         raw_input = {
-            "school": school, "sex": sex, "age": age, "address": address,
-            "famsize": famsize, "Pstatus": Pstatus, "Medu": Medu, "Fedu": Fedu,
+            "school": school, "sex": sex, "address": address,
+            "famsize": famsize, "Pstatus": Pstatus,
             "Mjob": Mjob, "Fjob": Fjob, "reason": reason, "guardian": guardian,
-            "traveltime": traveltime, "studytime": studytime, "failures": failures,
             "schoolsup": schoolsup, "famsup": famsup, "paid": paid,
             "activities": activities, "nursery": nursery, "higher": higher,
             "internet": internet, "romantic": romantic,
+            # numerical
+            "age": age, "Medu": Medu, "Fedu": Fedu,
+            "traveltime": traveltime, "studytime": studytime, "failures": failures,
             "famrel": famrel, "freetime": freetime, "goout": goout,
             "Dalc": Dalc, "Walc": Walc, "health": health, "absences": absences,
         }
 
-        # Encode categoricals using the fitted encoders
-        encoded_input = {}
-        for col, val in raw_input.items():
-            if col in encoders:
-                le = encoders[col]
-                if val in le.classes_:
-                    encoded_input[col] = le.transform([val])[0]
-                else:
-                    encoded_input[col] = 0   # fallback for unseen labels
-            else:
-                encoded_input[col] = val
+        input_raw_df = pd.DataFrame([raw_input])
 
-        input_df = pd.DataFrame([encoded_input])[feature_names]
+        # Transform using the fitted ColumnTransformer (same as training)
+        try:
+            input_transformed = preprocessor.transform(
+                input_raw_df[CATEGORICAL_COLS + NUMERICAL_COLS]
+            )
+        except Exception as e:
+            st.error(f"Input encoding failed: {e}")
+            st.stop()
 
         try:
-            predicted_grade = predict_single(model, input_df)
+            predicted_grade = predict_single(model, input_transformed)
         except Exception as e:
             st.error(f"Prediction failed: {e}")
             st.stop()
 
         color = grade_color(predicted_grade)
         label = grade_label(predicted_grade)
+        mae   = metrics["mae"]
 
         st.markdown("---")
         res_col1, res_col2 = st.columns([1, 2])
@@ -390,6 +415,9 @@ with tab_predict:
     <div class='prediction-grade' style='color:{color};'>{predicted_grade:.1f}</div>
     <div style='font-size:1.2rem; font-weight:600; color:{color}; margin-top:4px;'>{label}</div>
     <div style='font-size:0.85rem; color:#777; margin-top:8px;'>out of 20</div>
+    <div style='font-size:0.78rem; color:#999; margin-top:6px;'>
+        Typical error: ±{mae:.1f} grade points (MAE on test set)
+    </div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -407,12 +435,13 @@ with tab_predict:
             st.pyplot(fig)
             plt.close(fig)
 
-            st.markdown("""
+            st.markdown(f"""
 <div class='disclaimer'>
-⚠️ <b>Note:</b> This prediction is a statistical estimate based on historical patterns
-from the UCI Student Performance dataset.  It is <em>not</em> a guarantee of a
+⚠️ <b>Note:</b> This prediction is a <em>statistical estimate</em> based on historical patterns
+from the UCI Student Performance dataset.  The model's typical error on unseen students is
+approximately <b>±{mae:.1f} grade points</b> (MAE).  It is <em>not</em> a guarantee of a
 student's actual performance, potential, or future achievement.
-Educators should use this as one data point among many, not as a final judgment.
+Educators should use this as one data point among many, never as a final judgment.
 </div>
 """, unsafe_allow_html=True)
 
@@ -423,7 +452,8 @@ Educators should use this as one data point among many, not as a final judgment.
 with tab_metrics:
     st.header("📊 Model Evaluation Metrics")
     st.markdown(
-        "Metrics computed on the **held-out test set** (20% of data, 79 students). "
+        f"Metrics computed on the **held-out test set** (20% of data, {len(y_test)} students). "
+        f"Algorithm selected: **{best_name}** (lowest cross-validation MAE across 3 candidates). "
         "The model was trained with `random_state=42` for full reproducibility."
     )
 
@@ -458,6 +488,27 @@ with tab_metrics:
 
     st.markdown("---")
 
+    # ── cross-validation comparison table ──
+    st.subheader("Model Comparison (5-fold Cross-Validation on Training Set)")
+    st.markdown(
+        "Three regressors were compared using identical folds. "
+        "The test set was kept separate throughout. "
+        "Lower MAE is better."
+    )
+    cv_rows = []
+    for alg, res in cv_results.items():
+        cv_rows.append({
+            "Algorithm": alg,
+            "CV MAE (mean)": f"{res['mean_mae']:.4f}",
+            "CV MAE (±std)": f"{res['std_mae']:.4f}",
+            "CV RMSE (mean)": f"{res['mean_rmse']:.4f}",
+            "CV RMSE (±std)": f"{res['std_rmse']:.4f}",
+            "Selected": "✅" if alg == best_name else "",
+        })
+    st.dataframe(pd.DataFrame(cv_rows).set_index("Algorithm"), use_container_width=True)
+
+    st.markdown("---")
+
     chart_col1, chart_col2 = st.columns(2)
 
     # ── actual vs predicted scatter ──
@@ -469,7 +520,7 @@ with tab_metrics:
         ax.plot([lo, hi], [lo, hi], "r--", linewidth=1.5, label="Perfect prediction")
         ax.set_xlabel("Actual G3")
         ax.set_ylabel("Predicted G3")
-        ax.set_title("Actual vs. Predicted (test set)")
+        ax.set_title(f"Actual vs. Predicted (test set) — {best_name}")
         ax.legend(fontsize=8)
         ax.set_xlim(lo - 0.5, hi + 0.5)
         ax.set_ylim(lo - 0.5, hi + 0.5)
@@ -495,6 +546,11 @@ with tab_metrics:
 
     # ── feature importance ──
     st.subheader("Top 15 Feature Importances")
+    st.markdown(
+        "Feature importance scores indicate which variables the model relies on most "
+        "to split data — they do **not** imply causation and should not be used to "
+        "make claims about individual students."
+    )
     importance = get_feature_importance(model, feature_names)
     top15 = dict(list(importance.items())[:15])
     fig, ax = plt.subplots(figsize=(8, 5))
@@ -503,13 +559,20 @@ with tab_metrics:
     colors = ["#1f4e79" if v > np.mean(values) else "#5b9bd5" for v in values]
     bars = ax.barh(labels[::-1], values[::-1], color=colors[::-1])
     ax.set_xlabel("Importance Score")
-    ax.set_title("Feature Importance (Random Forest)")
+    ax.set_title(f"Feature Importance ({best_name})")
     for bar, val in zip(bars, values[::-1]):
         ax.text(bar.get_width() + 0.001, bar.get_y() + bar.get_height() / 2,
                 f"{val:.3f}", va="center", fontsize=8)
     fig.tight_layout()
     st.pyplot(fig)
     plt.close(fig)
+
+    st.markdown("""
+> **Limitations of feature importance:**
+> Scores reflect correlation patterns in historical data from two Portuguese schools.
+> They may not generalise to other contexts, and should never be used to label or
+> rank individual students.
+""")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -556,7 +619,7 @@ with tab_data:
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_about:
     st.header("ℹ️ About This Project")
-    st.markdown("""
+    st.markdown(f"""
 ### Student Performance Prediction System
 
 This dashboard was built as a machine-learning internship demonstration project.
@@ -573,9 +636,27 @@ using the **UCI Student Performance dataset**.
 | Target | G3 — final period grade (0–20) |
 | Excluded | G1 and G2 (earlier period grades — not available at prediction time) |
 | Features | 30 demographic, family, and study-habit variables |
-| Encoding | Label encoding for categorical variables |
+| Preprocessing | scikit-learn `ColumnTransformer`: `OrdinalEncoder` (categorical) + `StandardScaler` (numerical) |
+| Leakage prevention | Preprocessor fitted on training set only; test set transformed with same fitted object |
+| Unknown categories | `OrdinalEncoder` maps unseen values to −1 (no silent fallback to 0) |
 | Split | 80% train / 20% test (`random_state=42`) |
-| Algorithm | Random Forest Regressor (200 trees, `random_state=42`) |
+| Model selection | 5-fold CV on training set across RandomForest, ExtraTrees, GradientBoosting |
+| Selected algorithm | **{best_name}** (lowest mean CV MAE) |
+| Test-set evaluation | Single evaluation after model selection (no re-use) |
+
+---
+
+#### 📊 Measured Performance (held-out test set, {len(y_test)} students)
+
+| Metric | Value |
+|--------|-------|
+| MAE    | {metrics['mae']:.4f} grade points |
+| RMSE   | {metrics['rmse']:.4f} grade points |
+| R²     | {metrics['r2']:.4f} |
+
+> R² is modest because G1/G2 are deliberately excluded.
+> Predictions from study habits and demographics alone carry inherent variance.
+> These numbers are the actual measured values — not estimates or targets.
 
 ---
 
@@ -592,17 +673,19 @@ Dataset: [UCI Machine Learning Repository #320](https://archive.ics.uci.edu/data
 #### ⚠️ Important Disclaimer
 
 > Predictions generated by this tool are **statistical estimates** derived from
-> historical patterns in a specific dataset.  They do **not** account for individual
-> circumstances, teacher quality, personal effort changes, or any factor not present
-> in the data.  This tool should be used as a supplementary reference only — **not**
-> as a definitive assessment of any student's ability or future performance.
+> historical patterns in a specific dataset (two Portuguese schools, 2008).
+> They do **not** account for individual circumstances, teacher quality, personal
+> effort changes, or any factor not present in the data.  This tool should be
+> used as a supplementary reference only — **not** as a definitive assessment
+> of any student's ability or future performance.  Do not use predictions to
+> limit any student's opportunities.
 
 ---
 
 #### 🛠️ Technology Stack
 
 - **Python 3.x** · **pandas** · **NumPy**
-- **scikit-learn** (RandomForestRegressor)
+- **scikit-learn** (ColumnTransformer, OrdinalEncoder, StandardScaler, RandomForestRegressor, ExtraTreesRegressor, GradientBoostingRegressor)
 - **Streamlit** (dashboard)
 - **Matplotlib** (charts)
     """)
