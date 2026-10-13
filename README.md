@@ -102,6 +102,26 @@ signals, making predictions meaningful **before any grades are recorded**.
 | Selected algorithm | **RandomForestRegressor** (lowest mean CV MAE) |
 | Final evaluation | The selected model is evaluated **exactly once** on the held-out test set |
 
+### Why OrdinalEncoder rather than OneHotEncoder
+
+All three candidate models are decision-tree ensembles.  For tree-based models,
+`OrdinalEncoder` is the more appropriate choice for these categorical features:
+
+- **Representational equivalence:** a tree can recover any grouping of ordinal
+  codes with multiple binary splits, so `OneHotEncoder` adds no representational
+  advantage.
+- **Dimensionality:** `OneHotEncoder` would expand the 17 categorical columns
+  into ~45 binary columns, raising total features from 30 to ~58 on a 395-row
+  dataset — extra sparsity unlikely to improve and potentially harmful.
+- **Unknown-category handling:** `OneHotEncoder(handle_unknown="ignore")` maps
+  an unseen value to an all-zero vector, which looks identical to the reference
+  (first) category.  `OrdinalEncoder(unknown_value=-1)` produces a distinct
+  sentinel that the tree routes down its own branch — the behaviour is explicit
+  and auditable.
+- **Feature importance readability:** 30 features (one per original column)
+  keeps the importance chart directly interpretable; 58 OHE columns would
+  fragment importance across dummy variables.
+
 ---
 
 ## 📈 Model Comparison — Cross-Validation Results

@@ -5,12 +5,42 @@ Handles downloading, caching, and preprocessing the UCI Student Performance
 dataset (student-mat.csv).  G1 and G2 are intentionally excluded from
 features so the model cannot "cheat" by using earlier-term grades.
 
-The public API now returns a fitted scikit-learn ColumnTransformer (the
+The public API returns a fitted scikit-learn ColumnTransformer (the
 "preprocessor") alongside the split data, so that:
   • Training and inference use an identical, reproducible transformation.
   • Categorical inputs at inference time are encoded with the same fitted
-    OrdinalEncoder — unknown categories raise a clear ValueError instead
-    of silently mapping to 0.
+    OrdinalEncoder — unknown categories map to -1 instead of silently
+    collapsing to an existing category.
+
+Encoding choice — OrdinalEncoder vs OneHotEncoder
+--------------------------------------------------
+All three candidate models (RandomForest, ExtraTrees, GradientBoosting)
+are decision-tree ensembles.  For tree-based models:
+
+1. Representational equivalence: a tree can recover any grouping of
+   ordinal-coded categories with multiple binary splits, so OHE adds
+   no representational advantage over OrdinalEncoder.
+
+2. Dimensionality: OHE would expand the 17 categorical columns into
+   ~45 binary columns (each unique category becomes its own column),
+   raising the total feature count from 30 to ~58 on a dataset of only
+   395 rows.  The extra sparsity is more likely to introduce noise than
+   signal for this problem size.
+
+3. Unknown-category handling: OHE(handle_unknown="ignore") maps an
+   unseen value to an all-zero row — identical to the reference (first)
+   category, which silently misrepresents the input.
+   OrdinalEncoder(unknown_value=-1) produces a distinct sentinel that
+   the tree can route down a dedicated branch, making the behaviour
+   observable and auditable.
+
+4. Feature importance readability: keeping 30 features (one per raw
+   column) makes the importance chart directly interpretable; 58 OHE
+   columns would fragment importance across dummy variables.
+
+Conclusion: OrdinalEncoder is the appropriate choice for this dataset
+and these model families.  The decision is revisited in README.md under
+the Methodology section.
 """
 
 import io
@@ -148,10 +178,14 @@ def build_preprocessor(df: pd.DataFrame) -> ColumnTransformer:
                                              unknown_value=-1)
     Numerical columns    → StandardScaler  (zero mean, unit variance)
 
-    Setting handle_unknown='use_encoded_value' / unknown_value=-1 means that
-    any category not seen at fit time will produce a value of -1 rather than
-    silently mapping to 0 or raising a hard crash.  Tree-based models treat it
-    as a distinct split point; callers can inspect the -1 to warn the user.
+    Why OrdinalEncoder rather than OneHotEncoder
+    ---------------------------------------------
+    See the module-level docstring for the full rationale.  In brief:
+    all three candidate models are tree ensembles that handle ordinal
+    codes natively; OHE would triple the categorical feature count on
+    a 395-row dataset without adding representational power, and its
+    unknown-category behaviour (all-zeros ≡ reference category) is
+    less transparent than the −1 sentinel used here.
     """
     # Collect the unique sorted categories from the training data so the
     # encoder is fully deterministic.
